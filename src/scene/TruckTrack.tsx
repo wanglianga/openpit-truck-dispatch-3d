@@ -1,101 +1,161 @@
-import { useMemo } from 'react';
+import { useRef } from 'react';
+import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { useScheduleStore } from '../store/useScheduleStore';
-import { sampleTrack } from '../utils/lod';
 import { fleetColor } from '../utils/colors';
 import { sampleTrackForRender } from '../simulation/scheduler';
+import type { TrackSample } from '../simulation/types';
 
 export function TruckTrack() {
+  const lineGeomRef = useRef<THREE.BufferGeometry | null>(null);
+  const replayGeomRef = useRef<THREE.BufferGeometry | null>(null);
+  const dotsGroupRef = useRef<THREE.Group>(null);
+  const lineColorRef = useRef<THREE.LineBasicMaterial | null>(null);
+  const replayColorRef = useRef<THREE.LineBasicMaterial | null>(null);
+  const sampledRef = useRef<TrackSample[]>([]);
+  const startMeshRef = useRef<THREE.Mesh>(null);
+  const endMeshRef = useRef<THREE.Mesh>(null);
+  const containerRef = useRef<THREE.Group>(null);
+
+  const lastActiveRef = useRef<{ id: string | null; trackHash: string; replayTime: number; isReplay: boolean }>({
+    id: null,
+    trackHash: '',
+    replayTime: -1,
+    isReplay: false,
+  });
+
   const selectedId = useScheduleStore((s) => s.selectedTruckId);
   const hoveredId = useScheduleStore((s) => s.hoveredTruckId);
-  const trucks = useScheduleStore((s) => s.trucks);
-  const tracks = useScheduleStore((s) => s.replayTracks);
   const isReplayMode = useScheduleStore((s) => s.isReplayMode);
   const replayTruckId = useScheduleStore((s) => s.replayTruckId);
-  const replayTime = useScheduleStore((s) => s.replayTime);
 
-  const activeId = isReplayMode ? replayTruckId : selectedId || hoveredId;
-  const activeTrack = activeId ? tracks[activeId] : undefined;
-  const activeTruck = activeId ? trucks[activeId] : undefined;
+  useFrame(() => {
+    const state = useScheduleStore.getState();
+    const tracks = state.replayTracks;
+    const activeNow = isReplayMode ? replayTruckId : selectedId || hoveredId;
+    const activeTrack = activeNow ? tracks[activeNow] : undefined;
+    const replayTimeNow = state.replayTime;
+    const activeTruck = activeNow ? state.trucks[activeNow] : undefined;
 
-  const { positions, replayPositions, color } = useMemo(() => {
-    if (!activeTrack || !activeTruck) {
-      return { positions: null, replayPositions: null, color: '#fff' };
+    if (!activeTrack || !activeTruck || !activeNow) {
+      if (containerRef.current) containerRef.current.visible = false;
+      lastActiveRef.current = { id: null, trackHash: '', replayTime: -1, isReplay: false };
+      return;
     }
-    const sampled = sampleTrackForRender(activeTrack, 400);
-    const pts = sampled.map(
-      (p) => new THREE.Vector3(p.x, p.y + 0.15, p.z)
-    );
-    let replayEndIdx = sampled.length;
-    if (isReplayMode) {
-      for (let i = 0; i < sampled.length; i++) {
-        if (sampled[i].t >= replayTime) {
-          replayEndIdx = i;
-          break;
+    if (containerRef.current) containerRef.current.visible = true;
+
+    const hash = `${activeTrack.length}-${activeTrack[activeTrack.length - 1]?.t || 0}-${activeTrack[0]?.t || 0}`;
+    const trackChanged =
+      lastActiveRef.current.id !== activeNow || lastActiveRef.current.trackHash !== hash;
+    const replayChanged =
+      isReplayMode &&
+      Math.abs(lastActiveRef.current.replayTime - replayTimeNow) > 0.5;
+
+    if (trackChanged) {
+      const sampled = sampleTrackForRender(activeTrack, 400);
+      const pts = sampled.map((p) => new THREE.Vector3(p.x, p.y + 0.15, p.z));
+
+      if (!lineGeomRef.current) lineGeomRef.current = new THREE.BufferGeometry();
+      lineGeomRef.current.setFromPoints(pts);
+      sampledRef.current = sampled;
+
+      const col = fleetColor(activeTruck.fleet);
+      if (lineColorRef.current) lineColorRef.current.color.set(col);
+      if (replayColorRef.current) replayColorRef.current.color.set(col);
+
+      if (dotsGroupRef.current) {
+        dotsGroupRef.current.clear();
+        const step = Math.max(1, Math.floor(pts.length / 24));
+        for (let i = 0; i < pts.length; i += step) {
+          const p = pts[i];
+          const m = new THREE.Mesh(
+            new THREE.SphereGeometry(0.2, 8, 8),
+            new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.6 })
+          );
+          m.position.set(p.x, p.y + 0.3, p.z);
+          dotsGroupRef.current.add(m);
         }
       }
+
+      if (startMeshRef.current && pts.length > 1) {
+        startMeshRef.current.position.set(pts[0].x, pts[0].y + 0.4, pts[0].z);
+        startMeshRef.current.visible = true;
+      }
+      if (endMeshRef.current && pts.length > 1) {
+        const last = pts[pts.length - 1];
+        endMeshRef.current.position.set(last.x, last.y + 0.4, last.z);
+        endMeshRef.current.visible = true;
+      }
+      lastActiveRef.current.id = activeNow;
+      lastActiveRef.current.trackHash = hash;
     }
-    const replayed = pts.slice(0, replayEndIdx);
-    return {
-      positions: pts,
-      replayPositions: replayed,
-      color: fleetColor(activeTruck.fleet),
-    };
-  }, [activeTrack, activeTruck, isReplayMode, replayTime]);
 
-  if (!positions) return null;
+    if (trackChanged || replayChanged) {
+      const sampled = sampledRef.current.length > 0
+        ? sampledRef.current
+        : sampleTrackForRender(activeTrack, 400);
+      let replayEndIdx = sampled.length;
+      if (isReplayMode) {
+        for (let i = 0; i < sampled.length; i++) {
+          if (sampled[i].t >= replayTimeNow) {
+            replayEndIdx = i;
+            break;
+          }
+        }
+      }
+      const replayed = sampled.slice(0, replayEndIdx).map(
+        (p) => new THREE.Vector3(p.x, p.y + 0.15, p.z)
+      );
+      if (!replayGeomRef.current) replayGeomRef.current = new THREE.BufferGeometry();
+      if (replayed.length > 1) replayGeomRef.current.setFromPoints(replayed);
 
-  const lineGeom = new THREE.BufferGeometry().setFromPoints(positions);
-  const replayGeom = replayPositions
-    ? new THREE.BufferGeometry().setFromPoints(replayPositions)
-    : null;
+      if (replayColorRef.current) {
+        replayColorRef.current.opacity = isReplayMode ? 1 : 0;
+        replayColorRef.current.visible = isReplayMode && replayed.length > 1;
+      }
+      lastActiveRef.current.replayTime = replayTimeNow;
+      lastActiveRef.current.isReplay = isReplayMode;
+    }
+  });
 
   return (
-    <group name="truck-track">
+    <group name="truck-track" ref={containerRef}>
       <line>
-        <primitive object={lineGeom} attach="geometry" />
+        <primitive object={lineGeomRef.current || new THREE.BufferGeometry()} attach="geometry" />
         <lineBasicMaterial
-          color={color}
+          ref={(m) => {
+            if (m) lineColorRef.current = m;
+          }}
+          color="#ffffff"
           transparent
           opacity={0.35}
           linewidth={2}
         />
       </line>
 
-      {isReplayMode && replayGeom && replayPositions && replayPositions.length > 1 && (
-        <line>
-          <primitive object={replayGeom} attach="geometry" />
-          <lineBasicMaterial
-            color={color}
-            transparent
-            opacity={1}
-            linewidth={3}
-          />
-        </line>
-      )}
+      <line>
+        <primitive object={replayGeomRef.current || new THREE.BufferGeometry()} attach="geometry" />
+        <lineBasicMaterial
+          ref={(m) => {
+            if (m) replayColorRef.current = m;
+          }}
+          color="#ffffff"
+          transparent
+          opacity={0}
+          linewidth={3}
+        />
+      </line>
 
-      {positions.filter((_, i) => i % Math.max(1, Math.floor(positions.length / 24)) === 0).map((p, i) => (
-        <mesh
-          key={i}
-          position={[p.x, p.y + 0.3, p.z]}
-        >
-          <sphereGeometry args={[0.2, 8, 8]} />
-          <meshBasicMaterial color={color} transparent opacity={0.6} />
-        </mesh>
-      ))}
+      <group ref={dotsGroupRef} />
 
-      {positions.length > 1 && (
-        <>
-          <mesh position={[positions[0].x, positions[0].y + 0.4, positions[0].z]}>
-            <sphereGeometry args={[0.6, 12, 12]} />
-            <meshBasicMaterial color="#43A047" transparent opacity={0.85} />
-          </mesh>
-          <mesh position={[positions[positions.length - 1].x, positions[positions.length - 1].y + 0.4, positions[positions.length - 1].z]}>
-            <sphereGeometry args={[0.6, 12, 12]} />
-            <meshBasicMaterial color="#E53935" transparent opacity={0.85} />
-          </mesh>
-        </>
-      )}
+      <mesh ref={startMeshRef} visible={false}>
+        <sphereGeometry args={[0.6, 12, 12]} />
+        <meshBasicMaterial color="#43A047" transparent opacity={0.85} />
+      </mesh>
+      <mesh ref={endMeshRef} visible={false}>
+        <sphereGeometry args={[0.6, 12, 12]} />
+        <meshBasicMaterial color="#E53935" transparent opacity={0.85} />
+      </mesh>
     </group>
   );
 }

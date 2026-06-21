@@ -1,35 +1,72 @@
-import { useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
+import type { ThreeEvent } from '@react-three/fiber';
 import * as THREE from 'three';
 import { TruckMesh } from './Truck';
-import { useScheduleStore, visibleTruckIdsSelector } from '../store/useScheduleStore';
+import { useScheduleStore, useVisibleTruckIds } from '../store/useScheduleStore';
 import { fleetColor } from '../utils/colors';
-import type { Fleet, Truck as TruckT } from '../simulation/types';
+import type { Truck as TruckT } from '../simulation/types';
 
-function LowDetailFleet({ trucks }: { trucks: TruckT[] }) {
+const HIGH_COUNT = 22;
+const MEDIUM_COUNT = 65;
+const TOTAL_RENDERED = HIGH_COUNT + MEDIUM_COUNT;
+
+function LowDetailFleet() {
   const ref = useRef<THREE.InstancedMesh>(null);
   const dummy = useMemo(() => new THREE.Object3D(), []);
+  const colorBuf = useRef<Float32Array | null>(null);
 
   useFrame(() => {
     if (!ref.current) return;
     const mesh = ref.current;
-    trucks.forEach((t, i) => {
+    const state = useScheduleStore.getState();
+    const allTrucks = state.trucks;
+    const fleetFilter = state.fleetFilter;
+    const materialFilter = state.materialFilter;
+    const camPos = new THREE.Vector3(0, 80, 200);
+
+    const visibleEntries: { t: TruckT; d: number }[] = [];
+    for (const id in allTrucks) {
+      const t = allTrucks[id];
+      if (!t) continue;
+      if (fleetFilter !== 'all' && t.fleet !== fleetFilter) continue;
+      if (materialFilter !== 'all') {
+        if (materialFilter === 'coal' && t.material !== 'coal' && t.material !== null) continue;
+        if (materialFilter === 'ore' && t.material !== 'ore') continue;
+        if (materialFilter === 'waste' && t.material !== 'waste') continue;
+      }
+      const dx = t.position.x - camPos.x;
+      const dy = t.position.y - camPos.y;
+      const dz = t.position.z - camPos.z;
+      visibleEntries.push({ t, d: dx * dx + dy * dy + dz * dz });
+    }
+    visibleEntries.sort((a, b) => a.d - b.d);
+    const lowSlice = visibleEntries.slice(TOTAL_RENDERED);
+    if (mesh.count !== lowSlice.length) {
+      mesh.count = Math.max(1, lowSlice.length);
+      if (!colorBuf.current || colorBuf.current.length < lowSlice.length * 3) {
+        colorBuf.current = new Float32Array(Math.max(lowSlice.length, 1) * 3);
+      }
+    }
+    lowSlice.forEach((entry, i) => {
+      const t = entry.t;
       dummy.position.set(t.position.x, t.position.y + 1.2, t.position.z);
       dummy.rotation.set(0, t.heading, 0);
-      dummy.scale.set(1, 1, 1);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
       const c = new THREE.Color(fleetColor(t.fleet));
       mesh.setColorAt?.(i, c);
     });
     mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    if (mesh.instanceColor) {
+      (mesh.instanceColor as THREE.InstancedBufferAttribute).needsUpdate = true;
+    }
   });
 
   return (
     <instancedMesh
       ref={ref}
-      args={[undefined, undefined, trucks.length]}
+      args={[undefined, undefined, 1]}
       castShadow
       receiveShadow
     >
@@ -39,42 +76,121 @@ function LowDetailFleet({ trucks }: { trucks: TruckT[] }) {
   );
 }
 
+interface ManagedTruckInnerProps {
+  truckId: string;
+  isNight: boolean;
+  selected: boolean;
+  hovered: boolean;
+  registerRef: (id: string, g: THREE.Group | null) => void;
+}
+
+function ManagedTruckInner({
+  truckId,
+  isNight,
+  selected,
+  hovered,
+  registerRef,
+}: ManagedTruckInnerProps) {
+  const grpRef = useRef<THREE.Group>(null);
+  const initTruck = useScheduleStore.getState().trucks[truckId];
+
+  useEffect(() => {
+    registerRef(truckId, grpRef.current);
+    return () => registerRef(truckId, null);
+  }, [truckId, registerRef]);
+
+  return (
+    <group ref={grpRef}>
+      <TruckMesh
+        truck={initTruck}
+        isNight={isNight}
+        selected={selected}
+        hovered={hovered}
+        staticTruckId={truckId}
+      />
+    </group>
+  );
+}
+
 export function TruckFleet() {
   const { camera } = useThree();
-  const trucks = useScheduleStore((s) => s.trucks);
   const selectedId = useScheduleStore((s) => s.selectedTruckId);
   const hoveredId = useScheduleStore((s) => s.hoveredTruckId);
   const isNight = useScheduleStore((s) => s.isNight);
-  const visibleIds = useScheduleStore(visibleTruckIdsSelector);
   const setHovered = useScheduleStore((s) => s.setHoveredTruck);
   const setSelected = useScheduleStore((s) => s.setSelectedTruck);
 
-  const byDistance = useMemo(() => {
-    const cam = camera.position;
-    const arr = visibleIds
-      .map((id) => trucks[id])
-      .filter(Boolean)
-      .map((t) => {
-        const dx = t.position.x - cam.x;
-        const dy = t.position.y - cam.y;
-        const dz = t.position.z - cam.z;
-        return { t, d: Math.sqrt(dx * dx + dy * dy + dz * dz) };
+  const visibleIds = useVisibleTruckIds();
+
+  const renderedIds = useMemo(() => {
+    const allTrucks = useScheduleStore.getState().trucks;
+    const cx = camera.position.x;
+    const cy = camera.position.y;
+    const cz = camera.position.z;
+    const entries = visibleIds
+      .map((id) => {
+        const t = allTrucks[id];
+        if (!t) return null;
+        const dx = t.position.x - cx;
+        const dy = t.position.y - cy;
+        const dz = t.position.z - cz;
+        return { id, d: dx * dx + dy * dy + dz * dz };
       })
-      .sort((a, b) => a.d - b.d);
-    return arr;
-  }, [visibleIds, trucks, camera.position.x, camera.position.y, camera.position.z]);
+      .filter(Boolean) as { id: string; d: number }[];
+    entries.sort((a, b) => a.d - b.d);
+    return entries.slice(0, TOTAL_RENDERED).map((e) => e.id);
+  }, [camera.position.x, camera.position.y, camera.position.z, visibleIds]);
 
-  const HIGH_MAX = 22;
-  const MEDIUM_MAX = 65;
-  const highTrucks = byDistance.slice(0, HIGH_MAX).map((x) => x.t);
-  const mediumTrucks = byDistance.slice(HIGH_MAX, HIGH_MAX + MEDIUM_MAX).map((x) => x.t);
-  const lowTrucks = byDistance.slice(HIGH_MAX + MEDIUM_MAX).map((x) => x.t);
+  const truckGroupsRef = useRef<Map<string, THREE.Group>>(new Map());
+  const registerRef = (id: string, g: THREE.Group | null) => {
+    if (g) truckGroupsRef.current.set(id, g);
+    else truckGroupsRef.current.delete(id);
+  };
+  const registerRefMemo = useMemo(() => registerRef, []);
 
-  const allHighIds = useMemo(() => new Set(highTrucks.map((t) => t.id)), [highTrucks]);
-  const allMediumIds = useMemo(() => new Set(mediumTrucks.map((t) => t.id)), [mediumTrucks]);
-  const allLowIds = useMemo(() => new Set(lowTrucks.map((t) => t.id)), [lowTrucks]);
+  useFrame(() => {
+    const state = useScheduleStore.getState();
+    const allTrucks = state.trucks;
+    const fleetFilterNow = state.fleetFilter;
+    const materialFilterNow = state.materialFilter;
+    const cx = camera.position.x;
+    const cy = camera.position.y;
+    const cz = camera.position.z;
 
-  const onPointerOver = (id: string) => (e: any) => {
+    const bucketMap = new Map<string, 'high' | 'medium' | 'low'>();
+    const distEntries: { id: string; d: number }[] = [];
+    for (const id in allTrucks) {
+      const t = allTrucks[id];
+      if (!t) continue;
+      if (fleetFilterNow !== 'all' && t.fleet !== fleetFilterNow) continue;
+      if (materialFilterNow !== 'all') {
+        if (materialFilterNow === 'coal' && t.material !== 'coal' && t.material !== null) continue;
+        if (materialFilterNow === 'ore' && t.material !== 'ore') continue;
+        if (materialFilterNow === 'waste' && t.material !== 'waste') continue;
+      }
+      const dx = t.position.x - cx;
+      const dy = t.position.y - cy;
+      const dz = t.position.z - cz;
+      distEntries.push({ id, d: dx * dx + dy * dy + dz * dz });
+    }
+    distEntries.sort((a, b) => a.d - b.d);
+    for (let i = 0; i < distEntries.length; i++) {
+      if (i < HIGH_COUNT) bucketMap.set(distEntries[i].id, 'high');
+      else if (i < TOTAL_RENDERED) bucketMap.set(distEntries[i].id, 'medium');
+      else bucketMap.set(distEntries[i].id, 'low');
+    }
+
+    truckGroupsRef.current.forEach((grp, id) => {
+      const t = allTrucks[id];
+      if (!t || !grp) return;
+      grp.position.set(t.position.x, t.position.y, t.position.z);
+      grp.rotation.y = t.heading;
+      grp.visible = bucketMap.has(id) && bucketMap.get(id) !== 'low';
+      grp.userData._lodBucket = bucketMap.get(id);
+    });
+  });
+
+  const onPointerOver = (id: string) => (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
     setHovered(id);
     document.body.style.cursor = 'pointer';
@@ -83,7 +199,7 @@ export function TruckFleet() {
     setHovered(null);
     document.body.style.cursor = '';
   };
-  const onClick = (id: string) => (e: any) => {
+  const onClick = (id: string) => (e: ThreeEvent<PointerEvent>) => {
     e.stopPropagation();
     setSelected(selectedId === id ? null : id);
   };
@@ -98,45 +214,23 @@ export function TruckFleet() {
         }
       }}
     >
-      {highTrucks.map((t) => (
+      {renderedIds.map((id) => (
         <group
-          key={t.id}
-          onPointerOver={onPointerOver(t.id)}
+          key={id}
+          onPointerOver={onPointerOver(id)}
           onPointerOut={onPointerOut}
-          onClick={onClick(t.id)}
+          onClick={onClick(id)}
         >
-          <TruckMesh
-            truck={t}
+          <ManagedTruckInner
+            truckId={id}
             isNight={isNight}
-            selected={selectedId === t.id}
-            hovered={hoveredId === t.id}
+            selected={selectedId === id}
+            hovered={hoveredId === id}
+            registerRef={registerRefMemo}
           />
         </group>
       ))}
-
-      {mediumTrucks.map((t) => (
-        <group
-          key={t.id}
-          onPointerOver={onPointerOver(t.id)}
-          onPointerOut={onPointerOut}
-          onClick={onClick(t.id)}
-        >
-          <TruckMesh
-            truck={t}
-            isNight={isNight}
-            selected={selectedId === t.id}
-            hovered={hoveredId === t.id}
-          />
-        </group>
-      ))}
-
-      {lowTrucks.length > 0 && (
-        <group
-          onPointerMissed={() => {}}
-        >
-          <LowDetailFleet trucks={lowTrucks} />
-        </group>
-      )}
+      <LowDetailFleet />
     </group>
   );
 }

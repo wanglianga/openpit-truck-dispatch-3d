@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { shallow } from 'zustand/shallow';
 import type {
   Truck,
   Fleet,
@@ -11,7 +12,7 @@ import type {
   UnloadingArea,
   Excavator,
 } from '../simulation/types';
-import { createFleet, loadingPointMap, unloadingAreaMap, excavatorMap } from '../simulation/vehicleFactory';
+import { createFleet, excavatorMap } from '../simulation/vehicleFactory';
 import {
   createSchedulerState,
   simulateTick,
@@ -70,16 +71,35 @@ interface ScheduleStoreState {
   jumpToBookmark: (b: AccidentBookmark) => void;
 }
 
+function shallowSameRecord<T extends Record<string, unknown>>(a: T, b: T): boolean {
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  for (let i = 0; i < ka.length; i++) {
+    if (a[ka[i]] !== b[ka[i]]) return false;
+  }
+  return true;
+}
+
+function shallowSameArr<T>(a: T[], b: T[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 const TRUCK_COUNT = 60;
 const initialTrucks = createFleet(TRUCK_COUNT);
 const initialScheduler = createSchedulerState(initialTrucks);
+const initialExcavators = excavatorMap();
 
 export const useScheduleStore = create<ScheduleStoreState>((set, get) => ({
   schedulerState: initialScheduler,
   trucks: initialScheduler.trucks,
   loadingPoints: initialScheduler.loadingPoints,
   unloadingAreas: initialScheduler.unloadingAreas,
-  excavators: excavatorMap(),
+  excavators: initialExcavators,
   replayTracks: initialScheduler.replayTracks,
   bookmarks: initialScheduler.bookmarks,
 
@@ -111,22 +131,42 @@ export const useScheduleStore = create<ScheduleStoreState>((set, get) => ({
   fpsHistory: [],
 
   tickSim: () => {
-    const s = get().schedulerState;
+    const prev = get();
+    const s = prev.schedulerState;
     const next = simulateTick(s);
     const fpsAvg =
-      get().fpsHistory.length > 0
-        ? get().fpsHistory.reduce((a, b) => a + b, 0) / get().fpsHistory.length
+      prev.fpsHistory.length > 0
+        ? prev.fpsHistory.reduce((a, b) => a + b, 0) / prev.fpsHistory.length
         : 60;
     const stats = computeStats(next, fpsAvg);
-    const newExc = excavatorMap();
+
+    const nextTrucks = shallowSameRecord(prev.trucks, next.trucks)
+      ? prev.trucks
+      : next.trucks;
+    const nextLp = shallowSameRecord(prev.loadingPoints, next.loadingPoints)
+      ? prev.loadingPoints
+      : next.loadingPoints;
+    const nextUa = shallowSameRecord(prev.unloadingAreas, next.unloadingAreas)
+      ? prev.unloadingAreas
+      : next.unloadingAreas;
+    const nextTracks = shallowSameRecord(prev.replayTracks, next.replayTracks)
+      ? prev.replayTracks
+      : next.replayTracks;
+    const nextBms = shallowSameArr(prev.bookmarks, next.bookmarks)
+      ? prev.bookmarks
+      : next.bookmarks;
+    const nextExc = shallowSameRecord(prev.excavators, initialExcavators)
+      ? prev.excavators
+      : initialExcavators;
+
     set({
       schedulerState: next,
-      trucks: { ...next.trucks },
-      loadingPoints: { ...next.loadingPoints },
-      unloadingAreas: { ...next.unloadingAreas },
-      excavators: newExc,
-      replayTracks: next.replayTracks,
-      bookmarks: [...next.bookmarks],
+      trucks: nextTrucks,
+      loadingPoints: nextLp,
+      unloadingAreas: nextUa,
+      excavators: nextExc,
+      replayTracks: nextTracks,
+      bookmarks: nextBms,
       stats,
     });
   },
@@ -177,18 +217,40 @@ export const useScheduleStore = create<ScheduleStoreState>((set, get) => ({
   },
 }));
 
-export const visibleTruckIdsSelector = (s: ScheduleStoreState): string[] => {
-  const { trucks, fleetFilter, materialFilter } = s;
-  return Object.keys(trucks).filter((id) => {
-    const t = trucks[id];
-    if (fleetFilter !== 'all' && t.fleet !== fleetFilter) return false;
-    if (materialFilter !== 'all') {
-      if (materialFilter === 'coal' && t.material !== 'coal' && t.material !== null) return false;
-      if (materialFilter === 'ore' && t.material !== 'ore') return false;
-      if (materialFilter === 'waste' && t.material !== 'waste') return false;
-    }
-    return true;
-  });
+export const visibleTruckIdsSelector = {
+  deps: (s: ScheduleStoreState) =>
+    [s.fleetFilter, s.materialFilter, s.trucks] as const,
+  compute: (
+    fleetFilter: Fleet | 'all',
+    materialFilter: MaterialType | 'all',
+    trucks: Record<string, Truck>
+  ): string[] => {
+    return Object.keys(trucks).filter((id) => {
+      const t = trucks[id];
+      if (!t) return false;
+      if (fleetFilter !== 'all' && t.fleet !== fleetFilter) return false;
+      if (materialFilter !== 'all') {
+        if (materialFilter === 'coal' && t.material !== 'coal' && t.material !== null) return false;
+        if (materialFilter === 'ore' && t.material !== 'ore') return false;
+        if (materialFilter === 'waste' && t.material !== 'waste') return false;
+      }
+      return true;
+    });
+  },
 };
 
-export { segmentMap };
+export function useVisibleTruckIds(): string[] {
+  const fleetFilter = useScheduleStore((s) => s.fleetFilter);
+  const materialFilter = useScheduleStore((s) => s.materialFilter);
+  const trucks = useScheduleStore((s) => s.trucks);
+  return visibleTruckIdsSelector.compute(fleetFilter, materialFilter, trucks);
+}
+
+export { segmentMap, shallow };
+
+declare global {
+  interface Window { __scheduleStore: typeof useScheduleStore; }
+}
+if (import.meta.env.DEV) {
+  window.__scheduleStore = useScheduleStore;
+}
